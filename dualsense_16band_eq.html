@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DualSense 音频调试台 · 16 段 EQ</title>
+<style>
+  :root { color-scheme: dark; --bg:#111318; --card:#1b1e25; --line:#303541; --text:#eee; --muted:#9ba3b4; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,-apple-system,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
+  .wrap { max-width:1200px; margin:auto; padding:20px; }
+  h1 { margin:0 0 6px; font-size:25px; }
+  .sub { color:var(--muted); margin-bottom:18px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; }
+  .wide { grid-column:1/-1; }
+  button, select, input[type=file] {
+    background:#252a34; color:var(--text); border:1px solid #414857;
+    border-radius:9px; padding:9px 12px; cursor:pointer;
+  }
+  button:hover { background:#303643; }
+  .row { display:flex; flex-wrap:wrap; gap:9px; align-items:center; }
+  .status { margin-top:10px; padding:10px; border-radius:9px; background:#14171d; color:#b9c1d0; white-space:pre-wrap; }
+  .ok { color:#78e08f; } .warn { color:#ffd166; } .bad { color:#ff7675; }
+  #eq { display:grid; grid-template-columns:repeat(16, minmax(28px,1fr)); gap:8px; align-items:end; }
+  .band { text-align:center; min-width:0; }
+  .band input[type=range] {
+    writing-mode:vertical-lr; direction:rtl; width:28px; height:190px;
+    accent-color:#8ab4f8;
+  }
+  .freq { font-size:11px; color:#aeb6c5; margin-top:5px; }
+  .gain { font-size:11px; margin-top:2px; }
+  audio { width:100%; margin-top:12px; }
+  .meter { height:8px; background:#0c0e12; border-radius:99px; overflow:hidden; margin-top:10px; }
+  .meter > div { height:100%; width:0%; background:#8ab4f8; transition:width .05s linear; }
+  pre { white-space:pre-wrap; word-break:break-word; color:#bfc7d5; }
+  @media(max-width:800px){ .grid{grid-template-columns:1fr}.wide{grid-column:auto} #eq{grid-template-columns:repeat(8,1fr)} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>DualSense 本地音频调试台</h1>
+  <div class="sub">WebHID 手柄检测 + 16 段 EQ + 本地歌曲播放 + 系统音频输出选择</div>
+
+  <div class="grid">
+    <section class="card">
+      <h2>1. DualSense HID</h2>
+      <div class="row">
+        <button id="connectHid">连接 DualSense</button>
+        <button id="disconnectHid">断开</button>
+        <button id="readHid">读取 HID 信息</button>
+      </div>
+      <div id="hidStatus" class="status">未连接</div>
+    </section>
+
+    <section class="card">
+      <h2>2. 音频输出</h2>
+      <div class="row">
+        <button id="refreshOutputs">刷新输出设备</button>
+        <button id="chooseOutput">选择音频输出</button>
+      </div>
+      <select id="outputSelect" style="width:100%;margin-top:10px">
+        <option value="">默认系统输出</option>
+      </select>
+      <div id="audioStatus" class="status">
+        如果 Windows/Android/Chrome 把 DualSense 的耳机接口注册成“Wireless Controller”音频设备，这里应能看到它。
+      </div>
+    </section>
+
+    <section class="card wide">
+      <h2>3. 本地歌曲</h2>
+      <input id="file" type="file" accept="audio/*">
+      <audio id="player" controls preload="metadata"></audio>
+      <div class="meter"><div id="meter"></div></div>
+      <div class="row" style="margin-top:10px">
+        <label>总音量
+          <input id="master" type="range" min="0" max="1.5" step=".01" value="1">
+          <span id="masterVal">100%</span>
+        </label>
+        <button id="flat">EQ 归零</button>
+        <button id="savePreset">导出 EQ</button>
+        <input id="loadPreset" type="file" accept=".json">
+      </div>
+    </section>
+
+    <section class="card wide">
+      <h2>4. 16 段均衡器</h2>
+      <div style="color:#9ba3b4;font-size:13px;margin-bottom:12px">
+        每段为 Peaking EQ，范围 ±12 dB。频点：20 Hz ～ 20 kHz。
+      </div>
+      <div id="eq"></div>
+    </section>
+
+    <section class="card wide">
+      <h2>5. 调试信息</h2>
+      <pre id="debug">等待操作…</pre>
+    </section>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+/*
+  DualSense 常见 Sony VID/PID：
+    vendorId  = 0x054c (Sony)
+    productId = 0x0ce6 (DualSense)
+  WebHID 这里只负责 HID 连接/调试。
+  音频不会通过 HID 发送，而是通过 Web Audio API -> Chrome audio sink。
+*/
+
+const FREQUENCIES = [
+  20, 31.5, 50, 80, 125, 200, 315, 500,
+  800, 1250, 2000, 3150, 5000, 8000, 12500, 20000
+];
+
+let device = null;
+let audioCtx = null;
+let sourceNode = null;
+let masterGain = null;
+let filters = [];
+let analyser = null;
+let currentURL = null;
+let selectedSinkId = "";
+
+const $ = id => document.getElementById(id);
+const log = msg => {
+  $("debug").textContent = typeof msg === "string" ? msg : JSON.stringify(msg,null,2);
+};
+
+function makeEQ() {
+  const root = $("eq");
+  root.innerHTML = "";
+  FREQUENCIES.forEach((f, i) => {
+    const wrap = document.createElement("div");
+    wrap.className = "band";
+    wrap.innerHTML = `
+      <input id="eq${i}" type="range" min="-12" max="12" step="0.1" value="0"
+             aria-label="${f} Hz">
+      <div class="freq">${f >= 1000 ? (f/1000)+"k" : f} Hz</div>
+      <div class="gain" id="gain${i}">0 dB</div>`;
+    root.appendChild(wrap);
+    $("eq"+i).addEventListener("input", () => {
+      const v = Number($("eq"+i).value);
+      $("gain"+i).textContent = (v > 0 ? "+" : "") + v.toFixed(1) + " dB";
+      if (filters[i]) filters[i].gain.value = v;
+    });
+  });
+}
+
+async function ensureAudio() {
+  if (audioCtx) {
+    if (audioCtx.state === "suspended") await audioCtx.resume();
+    return;
+  }
+
+  audioCtx = new AudioContext();
+
+  sourceNode = audioCtx.createMediaElementSource($("player"));
+  masterGain = audioCtx.createGain();
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 2048;
+
+  let previous = sourceNode;
+
+  FREQUENCIES.forEach((f, i) => {
+    const filter = audioCtx.createBiquadFilter();
+    filter.type = "peaking";
+    filter.frequency.value = f;
+    filter.Q.value = 1.15;
+    filter.gain.value = 0;
+    filters.push(filter);
+    previous.connect(filter);
+    previous = filter;
+  });
+
+  previous.connect(masterGain);
+  masterGain.connect(analyser);
+  analyser.connect(audioCtx.destination);
+
+  if (selectedSinkId && audioCtx.setSinkId) {
+    try { await audioCtx.setSinkId(selectedSinkId); } catch(e) {
+      log("设置输出设备失败：\n" + e);
+    }
+  }
+
+  startMeter();
+}
+
+function startMeter() {
+  const data = new Uint8Array(analyser.frequencyBinCount);
+  function tick() {
+    if (!analyser) return;
+    analyser.getByteTimeDomainData(data);
+    let peak = 0;
+    for (const x of data) peak = Math.max(peak, Math.abs(x - 128));
+    $("meter").style.width = Math.min(100, peak / 1.28) + "%";
+    requestAnimationFrame(tick);
+  }
+  tick();
+}
+
+$("file").addEventListener("change", async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  await ensureAudio();
+  if (currentURL) URL.revokeObjectURL(currentURL);
+  currentURL = URL.createObjectURL(file);
+  $("player").src = currentURL;
+  $("player").load();
+  $("audioStatus").textContent = "正在播放文件：" + file.name;
+});
+
+$("master").addEventListener("input", async e => {
+  await ensureAudio();
+  const v = Number(e.target.value);
+  masterGain.gain.value = v;
+  $("masterVal").textContent = Math.round(v*100) + "%";
+});
+
+$("flat").addEventListener("click", () => {
+  FREQUENCIES.forEach((_,i) => {
+    $("eq"+i).value = 0;
+    $("gain"+i).textContent = "0 dB";
+    if (filters[i]) filters[i].gain.value = 0;
+  });
+});
+
+$("connectHid").addEventListener("click", async () => {
+  if (!("hid" in navigator)) {
+    $("hidStatus").innerHTML = '<span class="bad">当前 Chrome 不支持 WebHID。</span>';
+    return;
+  }
+
+  try {
+    const devices = await navigator.hid.requestDevice({
+      filters: [{vendorId:0x054c, productId:0x0ce6}]
+    });
+
+    if (!devices.length) {
+      $("hidStatus").textContent = "没有选择设备。";
+      return;
+    }
+
+    device = devices[0];
+    if (!device.opened) await device.open();
+
+    $("hidStatus").innerHTML =
+      '<span class="ok">已连接</span>：' +
+      (device.productName || "DualSense") +
+      " | VID 0x" + device.vendorId.toString(16) +
+      " | PID 0x" + device.productId.toString(16);
+
+    log({
+      productName: device.productName,
+      vendorId: "0x"+device.vendorId.toString(16),
+      productId: "0x"+device.productId.toString(16),
+      collections: device.collections
+    });
+
+    device.addEventListener("inputreport", ev => {
+      $("debug").textContent =
+        "收到 HID input report\n" +
+        "reportId: " + ev.reportId + "\n" +
+        "byteLength: " + ev.data.byteLength + "\n\n" +
+        Array.from(new Uint8Array(ev.data.buffer))
+          .map(x => x.toString(16).padStart(2,"0")).join(" ");
+    });
+
+  } catch (e) {
+    $("hidStatus").innerHTML =
+      '<span class="bad">连接失败：</span> ' + e.message;
+    log(e.stack || String(e));
+  }
+});
+
+$("disconnectHid").addEventListener("click", async () => {
+  try {
+    if (device && device.opened) await device.close();
+  } catch(e) {}
+  device = null;
+  $("hidStatus").textContent = "已断开";
+});
+
+$("readHid").addEventListener("click", async () => {
+  if (!device) {
+    log("还没有连接 DualSense。");
+    return;
+  }
+  log({
+    productName: device.productName,
+    vendorId: device.vendorId,
+    productId: device.productId,
+    opened: device.opened,
+    collections: device.collections
+  });
+});
+
+async function refreshOutputs() {
+  if (!navigator.mediaDevices?.enumerateDevices) {
+    $("audioStatus").textContent = "当前浏览器不支持 enumerateDevices。";
+    return;
+  }
+
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const outputs = devices.filter(d => d.kind === "audiooutput");
+  const sel = $("outputSelect");
+  sel.innerHTML = '<option value="">默认系统输出</option>';
+
+  for (const d of outputs) {
+    const opt = document.createElement("option");
+    opt.value = d.deviceId;
+    opt.textContent = d.label || ("音频输出 " + d.deviceId.slice(0,8));
+    sel.appendChild(opt);
+  }
+
+  $("audioStatus").textContent =
+    "检测到 " + outputs.length + " 个音频输出设备。" +
+    (outputs.some(d => /wireless controller|dualsense|sony/i.test(d.label))
+      ? " 找到了疑似 DualSense 音频设备。"
+      : " 没看到明显的 DualSense 音频设备；请确认系统已启用手柄音频输出。");
+}
+
+$("refreshOutputs").addEventListener("click", async () => {
+  try {
+    await ensureAudio();
+    await refreshOutputs();
+  } catch(e) {
+    log(e.stack || String(e));
+  }
+});
+
+$("chooseOutput").addEventListener("click", async () => {
+  try {
+    await ensureAudio();
+
+    if (navigator.mediaDevices.selectAudioOutput) {
+      const deviceInfo = await navigator.mediaDevices.selectAudioOutput();
+      selectedSinkId = deviceInfo.deviceId;
+      if (audioCtx.setSinkId) await audioCtx.setSinkId(selectedSinkId);
+      $("audioStatus").textContent =
+        "当前网页输出：" + (deviceInfo.label || selectedSinkId);
+      return;
+    }
+
+    alert("此 Chrome 没有 selectAudioOutput()。请先刷新设备列表，然后从下拉框选择输出。");
+  } catch(e) {
+    log(e.stack || String(e));
+  }
+});
+
+$("outputSelect").addEventListener("change", async e => {
+  selectedSinkId = e.target.value;
+  try {
+    await ensureAudio();
+    if (audioCtx.setSinkId) {
+      await audioCtx.setSinkId(selectedSinkId);
+      $("audioStatus").textContent =
+        selectedSinkId ? "已切换到指定音频输出。" : "已切换到默认系统输出。";
+    } else {
+      $("audioStatus").textContent =
+        "当前 Chrome 不支持 AudioContext.setSinkId()。";
+    }
+  } catch(e) {
+    log(e.stack || String(e));
+  }
+});
+
+$("savePreset").addEventListener("click", () => {
+  const preset = {
+    type:"DualSense-16Band-EQ",
+    frequencies:FREQUENCIES,
+    gains:FREQUENCIES.map((_,i)=>Number($("eq"+i).value))
+  };
+  const blob = new Blob([JSON.stringify(preset,null,2)], {type:"application/json"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "dualsense-eq.json";
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+$("loadPreset").addEventListener("change", async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  try {
+    const preset = JSON.parse(await file.text());
+    if (!Array.isArray(preset.gains) || preset.gains.length !== 16)
+      throw new Error("不是有效的 16 段 EQ 预设。");
+
+    await ensureAudio();
+    preset.gains.forEach((v,i) => {
+      const gain = Math.max(-12, Math.min(12, Number(v)));
+      $("eq"+i).value = gain;
+      $("gain"+i).textContent = (gain>0?"+":"") + gain.toFixed(1) + " dB";
+      filters[i].gain.value = gain;
+    });
+  } catch(e) {
+    alert(e.message);
+  }
+});
+
+navigator.hid?.addEventListener("connect", ev => {
+  log("HID 设备已连接：\n" + (ev.device.productName || "Unknown"));
+});
+
+navigator.hid?.addEventListener("disconnect", ev => {
+  if (device && ev.device === device) {
+    device = null;
+    $("hidStatus").textContent = "DualSense 已断开";
+  }
+});
+
+makeEQ();
+</script>
+</body>
+</html>
